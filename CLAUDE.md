@@ -1,16 +1,27 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
 # OpenAlice
 
 File-driven AI trading agent. All state (sessions, config, logs) stored as files — no database.
+
+This is a **pnpm + Turborepo monorepo**: the backend lives in `src/` (composition root: `src/main.ts`), the React frontend in `ui/` (Vite, separate `package.json`), and shared TypeScript packages in `packages/` (`@traderalice/ibkr`, `@traderalice/opentypebb`). The `predev` and `prebuild` scripts use Turbo to build the workspace packages before backend startup — adding a new package means adding it to the `predev` filter in `package.json`.
 
 ## Quick Start
 
 ```bash
 pnpm install
-pnpm dev        # Dev mode (tsx watch, port 3002)
-pnpm build      # Production build (backend + UI)
-pnpm test       # Vitest
-pnpm test:e2e   # e2e test
+pnpm dev              # Dev mode (tsx watch src/main.ts, port 3002)
+pnpm dev:ui           # UI dev server (pnpm --filter open-alice-ui dev)
+pnpm build            # Production build (turbo run build + tsup bundle)
+pnpm test             # Vitest unit tests
+pnpm test:watch       # Vitest in watch mode
+pnpm test:e2e         # End-to-end (vitest.e2e.config.ts)
+pnpm test:bbProvider  # OpenBB provider integration tests (vitest.bbProvider.config.ts)
 ```
+
+Run a single test file: `pnpm vitest run path/to/file.spec.ts` (or `... -t "test name"` to filter).
 
 ### Pre-commit Verification
 
@@ -107,60 +118,48 @@ migration framework at `src/migrations/`, not ad-hoc startup code.
 
 ## Project Structure
 
+For a fuller per-file breakdown, see [docs/project-structure.md](docs/project-structure.md). The high-level layout:
+
 ```
+packages/                  # Workspace packages (built by turbo before backend start)
+├── ibkr/                  # @traderalice/ibkr — IBKR TWS API TypeScript port
+└── opentypebb/            # @traderalice/opentypebb — OpenBB platform TS port
+
+ui/                        # React frontend (Vite, separate package.json)
+
 src/
-├── main.ts                    # Composition root
-├── core/
-│   ├── agent-center.ts        # Top-level AI orchestration, owns GenerateRouter
-│   ├── ai-provider-manager.ts # GenerateRouter + StreamableResult + AskOptions
-│   ├── tool-center.ts         # Centralized tool registry (Vercel + MCP export)
-│   ├── session.ts             # JSONL session store
-│   ├── compaction.ts          # Auto-summarize long context windows
-│   ├── config.ts              # Zod-validated config loader (generic account schema with brokerConfig)
-│   ├── ai-config.ts           # Runtime AI provider selection
-│   ├── event-log.ts           # Append-only JSONL event log
-│   ├── connector-center.ts    # ConnectorCenter — push delivery + last-interacted tracking
-│   ├── async-channel.ts       # AsyncChannel for streaming provider events to SSE
-│   ├── model-factory.ts       # Model instance factory for Vercel AI SDK
-│   ├── media.ts               # MediaAttachment extraction
-│   ├── media-store.ts         # Media file persistence
-│   └── types.ts               # Plugin, EngineContext interfaces
+├── main.ts                # Composition root
+├── core/                  # AgentCenter, ai-provider-manager, ToolCenter, session,
+│                          # compaction, config, connector-center, media,
+│                          # event-bus + listener/producer/pump (the event system),
+│                          # agent-work / agent-work-listener, inbox-store,
+│                          # notifications-store, tool-call-log, mcp-export
 ├── ai-providers/
-│   ├── vercel-ai-sdk/         # Vercel AI SDK ToolLoopAgent
-│   └── agent-sdk/             # Claude backend (@anthropic-ai/claude-agent-sdk, supports OAuth + API key)
+│   ├── vercel-ai-sdk/     # Vercel AI SDK ToolLoopAgent
+│   ├── agent-sdk/         # Claude backend (@anthropic-ai/claude-agent-sdk, OAuth + API key)
+│   ├── codex/             # OpenAI Codex backend
+│   └── mock/              # Test provider
 ├── domain/
-│   ├── market-data/           # Structured data layer (typebb in-process + OpenBB API remote)
-│   ├── trading/               # Unified multi-account trading, guard pipeline, git-like commits
-│   │   ├── account-manager.ts # UTA lifecycle (init, reconnect, enable/disable) + registry
-│   │   ├── git-persistence.ts # Git state load/save
-│   │   └── brokers/
-│   │       ├── registry.ts    # Broker self-registration (configSchema + configFields + fromConfig)
-│   │       ├── alpaca/        # Alpaca (US equities)
-│   │       ├── ccxt/          # CCXT (100+ crypto exchanges)
-│   │       ├── ibkr/          # Interactive Brokers (TWS/Gateway)
-│   │       └── mock/          # In-memory test broker
-│   ├── analysis/              # Indicators, technical analysis, sandbox
-│   ├── news/                  # RSS collector + archive search
-│   ├── brain/                 # Cognitive state (memory, emotion)
-│   └── thinking/              # Safe expression evaluator
-├── tool/                      # AI tool definitions — thin bridge from domain to ToolCenter
-│   ├── trading.ts             # Trading tools (delegates to domain/trading)
-│   ├── equity.ts              # Equity fundamental tools (uses domain/market-data)
-│   ├── market.ts              # Symbol search tools (uses domain/market-data)
-│   ├── analysis.ts            # Indicator calculation tools (uses domain/analysis)
-│   ├── news.ts                # News archive tools (uses domain/news)
-│   └── thinking.ts            # Reasoning tools (uses domain/thinking)
-├── connectors/
-│   ├── web/                   # Web UI (Hono, SSE streaming, sub-channels)
-│   ├── telegram/              # Telegram bot (grammY)
-│   └── mcp-ask/               # MCP Ask connector
-├── plugins/
-│   └── mcp.ts                 # MCP protocol server
-├── task/
-│   ├── cron/                  # Cron scheduling
-│   └── heartbeat/             # Periodic heartbeat
-└── skills/                    # Agent skill definitions
+│   ├── trading/           # Unified multi-account trading, guards, git-like commits
+│   │   └── brokers/       # registry.ts + alpaca / ccxt / ibkr / mock
+│   ├── market-data/       # equity / crypto / currency / commodity / economy + client/
+│   ├── analysis/          # Indicators, technical analysis
+│   ├── news/              # RSS collector + archive search
+│   └── thinking/          # Safe expression evaluator
+├── tool/                  # AI tool definitions — thin bridge from domain to ToolCenter
+│                          # (trading, equity, market, analysis, news, thinking,
+│                          #  session, economy, inbox-push, notify-user)
+├── server/                # mcp.ts (MCP protocol server) + opentypebb.ts (embedded HTTP API)
+├── connectors/            # web / telegram / mcp-ask / mock (push channels)
+├── webui/                 # Hono routes serving the React UI + workspaces WS bridge
+├── workspaces/            # Long-running agent workspaces — session pool, pty adapters,
+│                          # template registry, git/file services, scrollback store,
+│                          # transcript watcher, bash-based templates/
+├── task/                  # cron / heartbeat / metrics
+└── migrations/            # Numbered NNNN_short_name/ directories + registry.ts
 ```
+
+Note: `src/domain/brain/` has been retired (migration `0006_retire_brain`). MCP server lives at `src/server/mcp.ts` (was `src/plugins/mcp.ts`).
 
 ## Key Architecture
 
@@ -187,6 +186,14 @@ Per-request provider and model overrides via `AskOptions.provider` and `AskOptio
 ### ToolCenter
 
 Centralized registry. `tool/` files register tools via `ToolCenter.register()`, exports in Vercel and MCP formats. Decoupled from AgentCenter.
+
+### Event system (Listener / Producer / Pump)
+
+`core/event-bus.ts` + `core/listener.ts` + `core/producer.ts` + `core/pump.ts` + `core/listener-registry.ts` form an in-process pub/sub. **Always read [docs/event-system.md](docs/event-system.md) before touching any of those files or adding a new event type, Listener, or Producer** — the wiring requires touching multiple registries and has a documented set of pitfalls.
+
+### Workspaces subsystem
+
+`src/workspaces/` runs long-lived agent sandboxes (each its own pty + git working tree + scrollback). The session pool, registries, pty adapters, and bash templates all live here. The `webui/workspaces-ws.ts` WebSocket bridges browser UI to live workspace sessions. Templates under `src/workspaces/templates/*/bootstrap.sh` are cross-platform-bash (see the *Cross-platform note* at the top).
 
 ## Conventions
 
