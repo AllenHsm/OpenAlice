@@ -44,6 +44,18 @@ export function dataPath(...parts: string[]): string {
   return resolve(USER_DATA_HOME, 'data', ...parts)
 }
 
+/**
+ * Path under `logs/` — process log sinks (`alice.log`, `uta.log`, …).
+ *
+ * Sits at the OPENALICE_HOME root, NOT under the portable `data/` subtree:
+ * logs are machine-local operational output, not user state to back up,
+ * migrate, or share. OPENALICE_HOME is injected into every guardian child, so
+ * parent and children resolve the same logs dir without re-deriving the root.
+ */
+export function logsPath(...parts: string[]): string {
+  return resolve(USER_DATA_HOME, 'logs', ...parts)
+}
+
 /** Path under `default/` — shipped templates (persona, heartbeat, skills). */
 export function defaultPath(...parts: string[]): string {
   return resolve(APP_RESOURCES_HOME, 'default', ...parts)

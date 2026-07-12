@@ -12,6 +12,7 @@ import type { ToolCenter } from './tool-center.js'
 import type { WorkspaceToolCenter } from './workspace-tool-center.js'
 import type { IInboxStore } from './inbox-store.js'
 import type { IEntityStore } from './entity-store.js'
+import type { Logger } from './app-logger.js'
 
 export type { Config, WebChannel }
 
@@ -68,6 +69,11 @@ export interface EngineContext {
   utaManager: UTAManagerSDK
   tradingModePolicy: () => TradingModePolicy
   newsProvider?: INewsProvider
+
+  /** App-level structured logger (alice.log sink). Optional so plugins/tests
+   *  that build a partial context still type-check; when present, subsystems
+   *  take a `child({ component })` for a correlated trail. */
+  logger?: Logger
 }
 
 /** A media attachment collected from tool results (e.g. browser screenshots). */

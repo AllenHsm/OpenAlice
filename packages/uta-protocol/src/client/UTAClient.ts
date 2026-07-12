@@ -10,6 +10,8 @@
  * downstream error handling in the AI tool layer.
  */
 
+import { randomUUID } from 'node:crypto'
+
 export interface UTAClientOptions {
   /** UTA service base URL, e.g. `http://127.0.0.1:47333`. */
   baseUrl: string
@@ -32,6 +34,9 @@ export interface RequestOpts {
   body?: unknown
   params?: Record<string, string | number | undefined>
   signal?: AbortSignal
+  /** Correlation id to thread onto the request as `x-request-id`. When omitted,
+   *  the client mints one so every Alice→UTA call is traceable end to end. */
+  requestId?: string
 }
 
 export class UTAHttpError extends Error {
@@ -39,8 +44,10 @@ export class UTAHttpError extends Error {
     public readonly status: number,
     public readonly body: unknown,
     message: string,
+    /** `x-request-id` correlating this failure with the UTA-side access log. */
+    public readonly requestId?: string,
   ) {
-    super(message)
+    super(requestId ? `${message} [x-request-id: ${requestId}]` : message)
     this.name = 'UTAHttpError'
   }
 }
@@ -65,9 +72,13 @@ export function createUTAClient(options: UTAClientOptions): UTAClient {
     const controller = new AbortController()
     const timer = setTimeout(() => controller.abort(), timeoutMs)
     const signal = opts.signal ?? controller.signal
+    // Correlation id: reuse a caller-supplied id or mint one. This is the single
+    // header-injection seam for Alice→UTA — a later UTA-auth change extends the
+    // same headers object rather than threading a new argument everywhere.
+    const requestId = opts.requestId ?? randomUUID()
     const init: RequestInit = {
       method,
-      headers: { 'content-type': 'application/json' },
+      headers: { 'content-type': 'application/json', 'x-request-id': requestId },
       signal,
     }
     if (opts.body !== undefined) init.body = JSON.stringify(opts.body)
@@ -79,7 +90,7 @@ export function createUTAClient(options: UTAClientOptions): UTAClient {
         const msg = typeof body === 'object' && body && 'error' in body
           ? String((body as { error: unknown }).error)
           : `UTA ${method} ${path} returned ${res.status}`
-        throw new UTAHttpError(res.status, body, msg)
+        throw new UTAHttpError(res.status, body, msg, requestId)
       }
       return body as T
     } finally {

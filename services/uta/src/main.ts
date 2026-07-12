@@ -12,6 +12,9 @@
 
 import { Hono } from 'hono'
 import { serve } from '@hono/node-server'
+import { createAppLogger } from '@/core/app-logger.js'
+import { logsPath } from '@/core/paths.js'
+import { createRequestLog, type RequestLogVariables } from './http/request-log.js'
 import { loadConfig, readUTAsConfig, purgeEphemeralUTAs, type UTAConfig } from '@/core/config.js'
 import { parseDuration } from '@/core/duration.js'
 import { createEventLog } from '@/core/event-log.js'
@@ -38,9 +41,13 @@ import type { UTAEngineContext } from './types.js'
 const UTA_PORT = Number(process.env['OPENALICE_UTA_PORT'] ?? 47333)
 const CATALOG_REFRESH_MS = 6 * 60 * 60 * 1000  // 6h
 
+// Module-scope so both main() and the top-level fatal handler write to the
+// same rotating uta.log sink. mirrorConsole (default) keeps `pnpm dev` output.
+const log = createAppLogger({ file: logsPath('uta.log'), name: 'uta' })
+
 async function main(): Promise<void> {
   const startedAt = new Date().toISOString()
-  console.log(`[uta] bootstrap @ ${startedAt}`)
+  log.info('bootstrap', { startedAt })
 
   // Surface outbound-proxy config at startup so a user behind a proxy can
   // confirm UTA saw it — CCXT exchange instances are bridged onto it per
@@ -50,7 +57,9 @@ async function main(): Promise<void> {
     || process.env.HTTP_PROXY || process.env.http_proxy
     || process.env.ALL_PROXY || process.env.all_proxy
   if (outboundProxy) {
-    console.log(`[uta] outbound proxy detected (${outboundProxy.replace(/\/\/[^@/]*@/, '//***@')}) — bridging into CCXT exchanges`)
+    log.info('outbound proxy detected — bridging into CCXT exchanges', {
+      proxy: outboundProxy.replace(/\/\/[^@/]*@/, '//***@'),
+    })
   }
 
   const config = await loadConfig()
@@ -70,7 +79,7 @@ async function main(): Promise<void> {
   const userIds = new Set(survivors.map((u) => u.id))
   const dataUTAs: UTAConfig[] = buildKeylessDataUTAs(config.trading.keylessDataSources, userIds)
   if (dataUTAs.length > 0) {
-    console.log(`[uta] keyless data sources enabled: ${dataUTAs.map((u) => u.id).join(', ')}`)
+    log.info('keyless data sources enabled', { sources: dataUTAs.map((u) => u.id) })
   }
 
   for (const accCfg of [...dataUTAs, ...survivors]) {
@@ -82,7 +91,7 @@ async function main(): Promise<void> {
     try {
       await utaManager.initUTA(accCfg)
     } catch (err) {
-      console.warn(`[uta] failed to init "${accCfg.id}": ${err instanceof Error ? err.message : String(err)}`)
+      log.warn('failed to init UTA', { id: accCfg.id, error: err instanceof Error ? err.message : String(err) })
     }
   }
   utaManager.registerCcxtToolsIfNeeded()
@@ -110,7 +119,7 @@ async function main(): Promise<void> {
   const snapshotScheduler = createSnapshotScheduler({ snapshotService, config: config.snapshot })
   await snapshotScheduler.start()
   if (config.snapshot.enabled) {
-    console.log(`[uta] snapshot scheduler started (every ${config.snapshot.every})`)
+    log.info('snapshot scheduler started', { every: config.snapshot.every })
   }
 
   // ==================== Order-sync poller ====================
@@ -122,10 +131,13 @@ async function main(): Promise<void> {
   const observeRaw = config.trading.observeExternalOrdersEvery
   const observeIntervalMs = observeRaw === 'off' ? 0 : parseDuration(observeRaw)
   if (observeIntervalMs === null) {
-    console.warn(`[uta] trading.json observeExternalOrdersEvery "${observeRaw}" is not a duration (e.g. "15m") — falling back to 15m`)
+    log.warn('trading.json observeExternalOrdersEvery is not a duration (e.g. "15m") — falling back to 15m', { value: observeRaw })
   }
   startOrderSyncPoller(() => utaManager.resolve(), { observeIntervalMs: observeIntervalMs ?? 15 * 60_000 })
-  console.log(`[uta] order-sync poller started (10s pending lane; external-order observation ${observeRaw === 'off' ? 'off' : `every ${observeRaw}`})`)
+  log.info('order-sync poller started', {
+    pendingLaneMs: 10_000,
+    externalObservation: observeRaw === 'off' ? 'off' : observeRaw,
+  })
 
   // ==================== Catalog refresh ====================
   // Brokers that cache catalog (Alpaca / CCXT / Mock) need periodic refresh.
@@ -134,7 +146,7 @@ async function main(): Promise<void> {
   const catalogRefreshTimer = setInterval(() => {
     for (const uta of utaManager.resolve()) {
       uta.refreshCatalog().catch((err) => {
-        console.warn(`[uta] catalog-refresh ${uta.id} failed:`, err instanceof Error ? err.message : err)
+        log.warn('catalog-refresh failed', { id: uta.id, error: err instanceof Error ? err.message : String(err) })
       })
     }
   }, CATALOG_REFRESH_MS)
@@ -142,7 +154,12 @@ async function main(): Promise<void> {
 
   // ==================== HTTP app ====================
 
-  const app = new Hono()
+  const app = new Hono<{ Variables: RequestLogVariables }>()
+
+  // Access log — mounted first so every request (health, trading, 404s) gets a
+  // correlation id and one structured `http` event. Reads Alice's x-request-id
+  // when present so a single id threads Alice→UTA.
+  app.use('*', createRequestLog(log))
 
   // Health probe — used by Guardian readiness gate and Alice BFF supervisor.
   app.get('/__uta/health', (c) => c.json({
@@ -174,13 +191,13 @@ async function main(): Promise<void> {
     port: UTA_PORT,
     hostname: '127.0.0.1',
   })
-  console.log(`[uta] listening on http://127.0.0.1:${UTA_PORT}`)
+  log.info('listening', { url: `http://127.0.0.1:${UTA_PORT}` })
 
   let stopping = false
   const shutdown = async (signal: string): Promise<void> => {
     if (stopping) return
     stopping = true
-    console.log(`[uta] ${signal} → shutdown`)
+    log.info('shutdown', { signal })
     clearInterval(catalogRefreshTimer)
     snapshotScheduler.stop()
     server.close()
@@ -193,6 +210,6 @@ async function main(): Promise<void> {
 }
 
 main().catch((err) => {
-  console.error('[uta] fatal:', err)
+  log.error('fatal', { error: err instanceof Error ? err : String(err) })
   process.exit(1)
 })

@@ -10,7 +10,8 @@ import {
 // runs go through headless workspace dispatch (cron → workspace).
 import { loadConfig, readMarketDataConfig } from './core/config.js'
 import { printLegacyDataNotice } from './core/legacy-data-notice.js'
-import { dataPath, defaultPath, userDataHome } from '@/core/paths.js'
+import { dataPath, defaultPath, userDataHome, logsPath } from '@/core/paths.js'
+import { createAppLogger } from './core/app-logger.js'
 import { resolveLauncherRoot } from '@/workspaces/config.js'
 import type { Plugin, EngineContext } from './core/types.js'
 import { McpPlugin } from './server/mcp.js'
@@ -74,6 +75,24 @@ import { createNewsArchiveTools } from './tool/news.js'
 const PERSONA_FILE = dataPath('brain', 'persona.md')
 const PERSONA_DEFAULT = defaultPath('persona.default.md')
 
+// App-level structured logger for the Alice process (alice.log). Module scope
+// so the process-crash handlers below and the whole boot path share one
+// rotating sink. mirrorConsole (default) keeps `pnpm dev` output present.
+const log = createAppLogger({ file: logsPath('alice.log'), name: 'alice' })
+
+// Durably capture fatal process events that today only hit the console before
+// the process dies. Preserve Node's fail-fast semantics — a process in an
+// undefined state must not keep trading — while ensuring the record is flushed
+// (writes are synchronous) before exit.
+process.on('uncaughtException', (err) => {
+  log.error('uncaughtException', { error: err })
+  process.exit(1)
+})
+process.on('unhandledRejection', (reason) => {
+  log.error('unhandledRejection', { error: reason instanceof Error ? reason : String(reason) })
+  process.exit(1)
+})
+
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms))
 let runtimeLock: OpenAliceRuntimeLock | null = null
 
@@ -95,6 +114,8 @@ async function readWithDefault(target: string, defaultFile: string): Promise<str
 }
 
 async function main() {
+  log.info('alice boot', { pid: process.pid, node: process.version, home: userDataHome })
+
   // Before migrations create the new config dir: if this checkout carries a
   // pre-global-root data/ store, tell the user how to adopt it (covers bare
   // `pnpm start`; guardian children get OPENALICE_HOME so this stays quiet).
@@ -398,6 +419,7 @@ async function main() {
     utaManager,
     tradingModePolicy: currentTradingModePolicy,
     newsProvider: newsStore,
+    logger: log,
   }
 
   for (const plugin of [...corePlugins, ...optionalPlugins.values()]) {

@@ -13,7 +13,9 @@
  */
 
 import { Hono } from 'hono'
+import { randomUUID } from 'node:crypto'
 import { describeTradingMode, type TradingModePolicy } from '../../services/trading-mode.js'
+import type { Logger } from '../../core/app-logger.js'
 
 // Total request timeout. UTA is on the loopback interface so connect is
 // instant — this guards against handlers that legitimately take seconds
@@ -35,10 +37,14 @@ export function createTradingProxyRoutes(opts: {
   utaBaseUrl?: string
   disabledReason?: 'lite_mode'
   getPolicy?: () => TradingModePolicy
+  /** Optional structured logger — records proxy failures with the correlation
+   *  id so Alice's log lines up with UTA's access log. */
+  logger?: Logger
 }): Hono {
   const app = new Hono()
   const base = opts.utaBaseUrl?.replace(/\/$/, '')
   const disabledReason = opts.disabledReason
+  const log = opts.logger
   const getPolicy = opts.getPolicy ?? (() => ({
     mode: disabledReason === 'lite_mode' ? 'lite' : 'pro',
     source: disabledReason === 'lite_mode' ? 'env' : 'auto',
@@ -151,6 +157,11 @@ export function createTradingProxyRoutes(opts: {
       const v = incoming.headers.get(name)
       if (v !== null) forwardHeaders.set(name, v)
     }
+    // Correlation id: reuse the caller's x-request-id (already in the
+    // passthrough allowlist) or mint one, so a single id threads Alice's proxy
+    // log and UTA's access log for the same request.
+    const reqId = forwardHeaders.get('x-request-id') ?? randomUUID()
+    forwardHeaders.set('x-request-id', reqId)
 
     const controller = new AbortController()
     const connectTimer = setTimeout(() => controller.abort(), PROXY_TIMEOUT_MS)
@@ -170,6 +181,7 @@ export function createTradingProxyRoutes(opts: {
     } catch (err) {
       clearTimeout(connectTimer)
       const msg = err instanceof Error ? err.message : String(err)
+      log?.warn('uta proxy request failed', { reqId, method: incoming.method, path: c.req.path, error: msg })
       return c.json({
         error: 'UTA unavailable',
         detail: msg,
