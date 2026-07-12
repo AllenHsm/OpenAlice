@@ -20,6 +20,7 @@ import {
   UTAManager,
   createSnapshotService,
   createSnapshotScheduler,
+  GitJournalCorruptError,
 } from './domain/trading/index.js'
 import { FxService } from './domain/trading/fx-service.js'
 import {
@@ -82,7 +83,18 @@ async function main(): Promise<void> {
     try {
       await utaManager.initUTA(accCfg)
     } catch (err) {
-      console.warn(`[uta] failed to init "${accCfg.id}": ${err instanceof Error ? err.message : String(err)}`)
+      if (err instanceof GitJournalCorruptError) {
+        // Loud fail for the money path: this ONE account stays offline rather
+        // than boot with an empty trade-commit journal (which would re-trade as
+        // if it held nothing). Other accounts continue.
+        console.error(
+          `[uta] account "${accCfg.id}" NOT started — its trade-commit journal at ${err.path} is corrupt and ` +
+          `could not be recovered from a .bak backup. Trading for this account is OFFLINE to avoid amnesia. ` +
+          `Recover by restoring a good commit.json (or its .bak) for "${accCfg.id}", then restart UTA.`,
+        )
+      } else {
+        console.warn(`[uta] failed to init "${accCfg.id}": ${err instanceof Error ? err.message : String(err)}`)
+      }
     }
   }
   utaManager.registerCcxtToolsIfNeeded()

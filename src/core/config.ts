@@ -5,6 +5,7 @@ import { homedir } from 'os'
 import { newsCollectorSchema } from '../domain/news/config.js'
 import { runMigrations } from '../migrations/runner.js'
 import { dataPath } from '@/core/paths.js'
+import { writeFileAtomic } from '@/core/fs-atomic.js'
 import { isSealedEnvelope, seal, unseal } from './sealing.js'
 
 const CONFIG_DIR = dataPath('config')
@@ -683,9 +684,11 @@ function migrateLegacyUTA(raw: Record<string, unknown>): Record<string, unknown>
  * regress to plaintext credentials at rest.
  */
 async function writeAccountsFile(validated: UTAConfig[]): Promise<void> {
-  await mkdir(CONFIG_DIR, { recursive: true })
   const path = resolve(CONFIG_DIR, 'accounts.json')
-  await writeFile(path, JSON.stringify(await seal(validated), null, 2) + '\n', { mode: 0o600 })
+  // Atomic + owner-only + `.bak`: sealed broker credentials must never be left
+  // torn (a truncated envelope reads as "no accounts", silently dropping the
+  // user's brokers) nor exposed through a world-readable rename window.
+  await writeFileAtomic(path, JSON.stringify(await seal(validated), null, 2) + '\n', { mode: 0o600, backup: true })
   await chmod(path, 0o600).catch(() => { /* noop — platform without chmod */ })
 }
 

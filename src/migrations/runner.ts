@@ -13,13 +13,14 @@
  * time (warning UI is out of scope for the framework).
  */
 
-import { readFile, writeFile, mkdir, unlink, cp } from 'node:fs/promises'
+import { readFile, mkdir, unlink, cp } from 'node:fs/promises'
 import { readFileSync } from 'node:fs'
 import { resolve, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import type { Migration, MigrationContext, ConfigMeta } from './types.js'
 import { REGISTRY } from './registry.js'
 import { dataPath } from '@/core/paths.js'
+import { writeFileAtomic } from '@/core/fs-atomic.js'
 
 const CONFIG_DIR = dataPath('config')
 const BACKUP_DIR = dataPath('_backup')
@@ -56,8 +57,11 @@ export function makeDefaultContext(): MigrationContext {
       }
     },
     async writeJson(filename: string, data: unknown): Promise<void> {
-      await mkdir(CONFIG_DIR, { recursive: true })
-      await writeFile(resolve(CONFIG_DIR, filename), JSON.stringify(data, null, 2) + '\n')
+      // Atomic so a crash mid-migration can never leave `_meta.json` (the
+      // migration journal) or a config file torn — a half-written journal would
+      // re-run or skip migrations on the next boot. writeFileAtomic mkdir's the
+      // config dir itself.
+      await writeFileAtomic(resolve(CONFIG_DIR, filename), JSON.stringify(data, null, 2) + '\n')
     },
     async removeJson(filename: string): Promise<void> {
       try { await unlink(resolve(CONFIG_DIR, filename)) } catch (err) {

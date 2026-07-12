@@ -5,6 +5,9 @@ import './contract-ext.js'
 export { UnifiedTradingAccount } from './UnifiedTradingAccount.js'
 export type { UnifiedTradingAccountOptions, StagePlaceOrderParams, StageModifyOrderParams, StageClosePositionParams } from './UnifiedTradingAccount.js'
 
+// Git-state persistence
+export { GitJournalCorruptError } from './git-persistence.js'
+
 // UTAManager
 export { UTAManager } from './uta-manager.js'
 export type {
