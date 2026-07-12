@@ -324,6 +324,11 @@ export interface CascadeOpts {
   expectedExits?: Set<ChildProcess>
   /** Release process-wide ownership only after all children have been stopped. */
   onShutdown?: () => void | Promise<void>
+  /** Invoked when a non-critical child exits *unexpectedly* — i.e. not during
+   *  Guardian shutdown and not an expected (restart) kill. Lets the carrier
+   *  decide whether to auto-respawn it. Fires after the "optional service
+   *  offline" warn; the child is NOT restarted for you. */
+  onNonCriticalExit?: (child: ChildProcess, info: { code: number | null; signal: NodeJS.Signals | null }) => void
 }
 
 export interface CascadeControl {
@@ -373,6 +378,7 @@ export function installCascadeShutdown(opts: CascadeOpts): CascadeControl {
       }
       if (nonCritical.has(child)) {
         console.warn(`[guardian] ${childTag(child, children)} exited (code=${code}, signal=${signal}) — optional service offline, continuing`)
+        opts.onNonCriticalExit?.(child, { code, signal })
         return
       }
       console.log(`[guardian] ${childTag(child, children)} exited (code=${code}, signal=${signal}) — cascading shutdown`)
@@ -443,6 +449,15 @@ export class UTAController {
     return this.child
   }
 
+  /** Spawn a fresh UTA child, point the controller + cascade at it, return it.
+   *  Shared by the intentional restart() and the crash-driven respawnCrashed(). */
+  private spawnReplacement(old: ChildProcess): ChildProcess {
+    const next = spawnChild(this.spec)
+    this.child = next
+    this.cascade?.trackReplacement(old, next)
+    return next
+  }
+
   async restart(): Promise<void> {
     if (this.restarting) {
       console.log(`[guardian] UTA restart already in progress, skipping`)
@@ -461,9 +476,7 @@ export class UTAController {
         await exited
       }
 
-      const next = spawnChild(this.spec)
-      this.child = next
-      this.cascade?.trackReplacement(old, next)
+      this.spawnReplacement(old)
 
       const ready = await waitForHttp(this.healthUrl, { timeoutMs: 15_000 })
       if (!ready) {
@@ -474,6 +487,27 @@ export class UTAController {
     } finally {
       this.restarting = false
     }
+  }
+
+  /**
+   * Respawn after an *unexpected* crash — the old child has already exited, so
+   * unlike restart() there is nothing to SIGTERM/await. Mirrors restart()'s
+   * spawn half (fresh child + cascade rewire + health gate) but leaves the
+   * health check fire-and-forget, like the initial boot, so a fast-crashing
+   * respawn can't stall the caller's backoff loop. `onHealthy` fires only if it
+   * actually comes up. Backoff/give-up scheduling is the caller's job (see
+   * createRespawnPolicy in @traderalice/guardian-runtime).
+   */
+  respawnCrashed(onHealthy?: () => void): void {
+    this.spawnReplacement(this.child)
+    void waitForHttp(this.healthUrl, { timeoutMs: 15_000 }).then((ready) => {
+      if (ready) {
+        console.log(`[guardian] UTA respawned and healthy`)
+        onHealthy?.()
+      } else {
+        console.warn(`[guardian] UTA respawn did not become healthy within 15s — will retry on next crash`)
+      }
+    })
   }
 }
 

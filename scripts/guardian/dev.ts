@@ -21,6 +21,7 @@ import type { ChildProcess } from 'node:child_process'
 import {
   RuntimeAlreadyRunningError,
   acquireGuardianRuntime,
+  createRespawnPolicy,
   currentProcessStartedAt,
   takeoverRequested,
   type RuntimeProcessLock,
@@ -149,18 +150,50 @@ async function main(): Promise<void> {
     prefixLogs: true,
   }
 
+  // Auto-respawn policy for a crashed UTA — exponential backoff, give up after
+  // a burst of crashes, reset once a spawn stays healthy. Pure logic; the
+  // setTimeout below is the only timer.
+  const respawnPolicy = createRespawnPolicy()
+
   let uta: UTAController | null = null
   const spawnUTAController = () => {
     const utaInitial = spawnChild(utaSpec)
     void waitForHttp(`${utaUrl}/__uta/health`, { timeoutMs: 15_000 })
       .then((ready) => {
-        if (ready) console.log(`[guardian] UTA ready`)
+        if (ready) { console.log(`[guardian] UTA ready`); respawnPolicy.onSpawned() }
         else console.warn(`[guardian] UTA did not become ready within 15s — continuing with trading offline`)
       })
     return new UTAController(utaSpec, `${utaUrl}/__uta/health`, utaInitial)
   }
   if (!liteMode) {
     uta = spawnUTAController()
+  }
+
+  // ── Crash auto-respawn ────────────────────────────────────
+  // When the live UTA child exits unexpectedly (not shutdown, not a restart),
+  // installCascadeShutdown calls onNonCriticalExit below. We consult the policy
+  // and either schedule a backed-off respawn or log a give-up alert.
+  let pendingRespawn: NodeJS.Timeout | null = null
+  const clearPendingRespawn = (): void => {
+    if (pendingRespawn) { clearTimeout(pendingRespawn); pendingRespawn = null }
+  }
+  const onUtaCrash = (child: ChildProcess): void => {
+    if (!uta || uta.process !== child) return // stale child (already replaced) — ignore
+    const decision = respawnPolicy.onCrash()
+    if (decision.action === 'give-up') {
+      console.error(
+        `[guardian] UTA has crashed ${decision.attempt - 1} times without recovering — giving up on ` +
+        `auto-respawn. Trading stays offline until a broker-config change (restart-uta.flag) or a fresh \`pnpm dev\`.`,
+      )
+      return
+    }
+    console.warn(`[guardian] UTA crashed — auto-respawn attempt ${decision.attempt} in ${decision.delayMs}ms`)
+    clearPendingRespawn()
+    pendingRespawn = setTimeout(() => {
+      pendingRespawn = null
+      uta?.respawnCrashed(() => respawnPolicy.onSpawned())
+    }, decision.delayMs)
+    pendingRespawn.unref()
   }
 
   // ── Alice ─────────────────────────────────────────────────
@@ -210,6 +243,7 @@ async function main(): Promise<void> {
     children: [...(uta ? [uta.process] : []), alice, vite],
     ...(uta ? { nonCriticalChildren: new Set([uta.process]) } : {}),
     onShutdown: releaseGuardianRuntimeLock,
+    onNonCriticalExit: (child) => onUtaCrash(child),
   })
 
   // UTA restart cooperates with cascade — old SIGTERM is "expected", new
@@ -229,6 +263,10 @@ async function main(): Promise<void> {
     flagPath,
     onTrigger: () => {
       void (async () => {
+        // An operator-driven config change supersedes any crash-respawn in
+        // flight — drop the pending timer and wipe the backoff strikes.
+        clearPendingRespawn()
+        respawnPolicy.reset()
         const mode = await resolveGuardianTradingMode(process.env, dataHome)
         if (mode.mode === 'lite') {
           if (uta) {

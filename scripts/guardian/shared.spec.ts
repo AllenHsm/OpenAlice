@@ -1,10 +1,12 @@
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { EventEmitter } from 'node:events'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import type { ChildProcess } from 'node:child_process'
 
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { isLiteModeEnv, readPortsFile, resolveGuardianTradingMode, resolvePortConfig, resolveWindowsBin, startFlagWatcher } from './shared.js'
+import { installCascadeShutdown, isLiteModeEnv, readPortsFile, resolveGuardianTradingMode, resolvePortConfig, resolveWindowsBin, startFlagWatcher, type CascadeControl } from './shared.js'
 
 let home: string
 
@@ -168,6 +170,74 @@ describe('resolveWindowsBin — Windows .CMD shim resolution (#378)', () => {
     const spaced = 'C:\\Program Files\\proj\\node_modules\\.bin'
     expect(resolveWindowsBin('tsx', 'win32', spaced, () => true))
       .toBe('"C:\\Program Files\\proj\\node_modules\\.bin\\tsx.CMD"')
+  })
+})
+
+describe('installCascadeShutdown — non-critical (UTA) crash hook', () => {
+  const installed: CascadeControl[] = []
+
+  function fakeChild(cmd = 'uta'): ChildProcess {
+    const ee = new EventEmitter()
+    Object.assign(ee, {
+      exitCode: null,
+      killed: false,
+      pid: 4242,
+      spawnargs: [cmd],
+      kill: () => true,
+    })
+    return ee as unknown as ChildProcess
+  }
+
+  function install(opts: Parameters<typeof installCascadeShutdown>[0]): CascadeControl {
+    const control = installCascadeShutdown(opts)
+    installed.push(control)
+    return control
+  }
+
+  afterEach(() => {
+    // installCascadeShutdown registers process signal listeners; remove the
+    // exact functions it returned so they don't leak across tests.
+    for (const control of installed) {
+      for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP'] as const) {
+        process.removeListener(sig, control.shutdown as unknown as NodeJS.SignalsListener)
+      }
+    }
+    installed.length = 0
+  })
+
+  it('invokes onNonCriticalExit when a non-critical child exits unexpectedly', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const utaChild = fakeChild('uta')
+    const alice = fakeChild('alice')
+    const calls: Array<{ child: ChildProcess; info: { code: number | null; signal: NodeJS.Signals | null } }> = []
+    install({
+      children: [utaChild, alice],
+      nonCriticalChildren: new Set([utaChild]),
+      onNonCriticalExit: (child, info) => calls.push({ child, info }),
+    })
+
+    utaChild.emit('exit', 1, null)
+
+    expect(calls).toHaveLength(1)
+    expect(calls[0]!.child).toBe(utaChild)
+    expect(calls[0]!.info).toEqual({ code: 1, signal: null })
+    warn.mockRestore()
+  })
+
+  it('does NOT invoke onNonCriticalExit for an expected (restart) exit', () => {
+    const utaChild = fakeChild('uta')
+    const alice = fakeChild('alice')
+    const calls: ChildProcess[] = []
+    const control = install({
+      children: [utaChild, alice],
+      nonCriticalChildren: new Set([utaChild]),
+      onNonCriticalExit: (child) => calls.push(child),
+    })
+
+    control.expectExit(utaChild) // Guardian is intentionally killing it (restart)
+    utaChild.emit('exit', 0, 'SIGTERM')
+
+    expect(calls).toHaveLength(0)
   })
 })
 

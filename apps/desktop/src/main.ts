@@ -26,6 +26,7 @@ import { runRendererWorkspaceAcceptanceSmoke } from './workspace-acceptance-smok
 import { planUTATransition } from './uta-lifecycle.js'
 import {
   acquireGuardianRuntime,
+  createRespawnPolicy,
   currentProcessStartedAt,
   inspectOpenAliceInstance,
   resolveGuardianTradingMode,
@@ -53,6 +54,15 @@ let alice: ChildProcess | null = null
 let appQuitting = false
 let restartingUTA = false
 let pendingUTAMode: GuardianTradingModePlan | null = null
+
+// Auto-respawn a crashed UTA with exponential backoff (mirrors dev.ts /
+// prod.mjs). Pure policy from @traderalice/guardian-runtime; the setTimeout in
+// the spawnUTA exit handler is the only timer.
+const utaRespawnPolicy = createRespawnPolicy()
+let pendingUTARespawn: ReturnType<typeof setTimeout> | null = null
+function clearPendingUTARespawn(): void {
+  if (pendingUTARespawn) { clearTimeout(pendingUTARespawn); pendingUTARespawn = null }
+}
 let rendererOnboardingSmokeStarted = false
 let rendererTradingModeSmokeStarted = false
 let rendererWorkspaceAcceptanceSmokeStarted = false
@@ -695,6 +705,26 @@ app.whenReady().then(async () => {
     child.once('exit', (code, signal) => {
       if (appQuitting || restartingUTA) return
       console.error(`[guardian] UTA exited unexpectedly code=${code} signal=${signal} — trading offline, app stays up`)
+      if (child !== uta) return // stale child already replaced
+      const decision = utaRespawnPolicy.onCrash()
+      if (decision.action === 'give-up') {
+        console.error(`[guardian] UTA has crashed ${decision.attempt - 1} times without recovering — giving up on auto-respawn until a broker-config change or an app restart.`)
+        return
+      }
+      console.warn(`[guardian] UTA crashed — auto-respawn attempt ${decision.attempt} in ${decision.delayMs}ms`)
+      clearPendingUTARespawn()
+      pendingUTARespawn = setTimeout(() => {
+        pendingUTARespawn = null
+        if (appQuitting || restartingUTA) return
+        // Old child already exited; spawnUTA (recursively) rewires the exit
+        // handler onto the fresh child, so its own crash re-enters the backoff.
+        uta = spawnUTA()
+        void waitForUTA(utaUrl).then((ready) => {
+          if (ready) { console.log('[guardian] UTA back online after auto-respawn'); utaRespawnPolicy.onSpawned() }
+          else console.warn('[guardian] UTA did not come up after auto-respawn — will retry on next crash')
+        })
+      }, decision.delayMs)
+      pendingUTARespawn.unref?.()
     })
     return child
   }
@@ -937,6 +967,9 @@ async function reconcileUTA(
   spawnUTA: () => ChildProcess,
 ): Promise<void> {
   if (appQuitting) return
+  // An operator-driven config change supersedes any crash-respawn in flight.
+  clearPendingUTARespawn()
+  utaRespawnPolicy.reset()
   pendingUTAMode = mode
   if (restartingUTA) return
 

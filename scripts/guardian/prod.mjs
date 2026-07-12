@@ -32,6 +32,7 @@ import { dirname, resolve } from 'node:path'
 import { setTimeout as sleep } from 'node:timers/promises'
 import {
   acquireGuardianRuntime,
+  createRespawnPolicy,
   currentProcessStartedAt,
   takeoverRequested,
 } from '@traderalice/guardian-runtime'
@@ -168,6 +169,14 @@ let aliceChild = null
 let restartingUTA = false
 let guardianRuntimeLock = null
 
+// Auto-respawn a crashed UTA with exponential backoff (mirrors dev.ts). Pure
+// policy from the built package; the setTimeout below is the only timer.
+const utaRespawnPolicy = createRespawnPolicy()
+let pendingUTARespawn = null
+function clearPendingUTARespawn() {
+  if (pendingUTARespawn) { clearTimeout(pendingUTARespawn); pendingUTARespawn = null }
+}
+
 console.log('[guardian/prod] starting')
 console.log(`[guardian/prod] mode  → ${TRADING_MODE.mode} (${TRADING_MODE.source}${TRADING_MODE.envLocked ? ', env-locked' : ''})`)
 console.log(`[guardian/prod] data  → ${DATA_HOME}`)
@@ -200,8 +209,38 @@ function spawnUTA() {
   child.once('exit', (code, signal) => {
     if (stopping || restartingUTA) return
     console.error(`[guardian/prod] UTA exited unexpectedly (code=${code}, signal=${signal}) — trading offline, Alice stays up`)
+    if (child !== utaChild) return // stale child already replaced
+    const decision = utaRespawnPolicy.onCrash()
+    if (decision.action === 'give-up') {
+      console.error(`[guardian/prod] UTA has crashed ${decision.attempt - 1} times without recovering — giving up on auto-respawn. Trading stays offline until restart-uta.flag or a container restart.`)
+      return
+    }
+    console.warn(`[guardian/prod] UTA crashed — auto-respawn attempt ${decision.attempt} in ${decision.delayMs}ms`)
+    clearPendingUTARespawn()
+    pendingUTARespawn = setTimeout(() => {
+      pendingUTARespawn = null
+      respawnCrashedUTA()
+    }, decision.delayMs)
+    pendingUTARespawn.unref?.()
   })
   return child
+}
+
+// Crash-driven respawn (old child already exited). Unlike restartUTA there is
+// nothing to SIGTERM/await; leave the health check fire-and-forget so a
+// fast-crashing respawn can't stall the backoff loop. Does NOT set
+// restartingUTA — the new child's own crash must re-enter the backoff.
+function respawnCrashedUTA() {
+  if (stopping || restartingUTA) return
+  utaChild = spawnUTA()
+  void waitForUTA().then((ready) => {
+    if (ready) {
+      console.log('[guardian/prod] UTA back online after auto-respawn')
+      utaRespawnPolicy.onSpawned()
+    } else {
+      console.warn('[guardian/prod] UTA did not come up after auto-respawn — will retry on next crash')
+    }
+  })
 }
 
 function spawnAlice() {
@@ -243,6 +282,9 @@ async function waitForUTA() {
 }
 
 async function restartUTA() {
+  // An operator-driven config change supersedes any crash-respawn in flight.
+  clearPendingUTARespawn()
+  utaRespawnPolicy.reset()
   TRADING_MODE = await resolveTradingMode(process.env, DATA_HOME)
   if (TRADING_MODE.mode === 'lite') {
     if (utaChild && utaChild.exitCode === null) {
