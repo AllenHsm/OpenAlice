@@ -27,6 +27,9 @@ function makeCtx(brokers: Record<string, MockBroker | object>): UTAEngineContext
       resolve: () => [...utas.values()],
       listUTAs: () => [...utas.values()].map(u => ({ id: u.id, label: u.label })),
     },
+    // Permissive policy stub — venue-write gate allows all here; the gate's
+    // own matrix is proven in venue-policy.spec.ts.
+    policy: { mode: async () => 'pro' as const, allowAiTrading: async () => true },
   } as unknown as UTAEngineContext
 }
 

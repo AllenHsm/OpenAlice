@@ -20,6 +20,7 @@ import { WebPlugin } from './webui/index.js'
 import { createWorkspaceServiceRef } from './webui/plugin.js'
 import { createThinkingTools } from './tool/thinking.js'
 import { createUTAClient } from '@traderalice/uta-protocol'
+import { loadOrCreateUTAServiceToken } from './core/uta-service-token.js'
 import { UTAManagerSDK } from './services/uta-client/index.js'
 import { waitForUTAReady } from './services/uta-supervisor/health.js'
 import { resolveUTAUrl } from './services/uta-supervisor/url.js'
@@ -165,7 +166,16 @@ async function main() {
   }
   const utaDisabled = currentTradingModePolicy().mode === 'lite'
   const utaUrl = resolveUTAUrl()
-  const utaClient = createUTAClient({ baseUrl: utaUrl })
+  // Alice co-creates the Alice↔UTA service token at boot (UTA does the same;
+  // wx-exclusive create means the first process wins and the other adopts it).
+  // The agent client presents it as a bearer token and tags itself `agent`, so
+  // UTA's in-process policy gate can enforce allowAiTrading on direct pushes.
+  await loadOrCreateUTAServiceToken()
+  const utaClient = createUTAClient({
+    baseUrl: utaUrl,
+    authToken: (o) => loadOrCreateUTAServiceToken(o),
+    actor: 'agent',
+  })
   if (utaDisabled) {
     console.warn('uta: disabled by trading mode lite — continuing without trading carrier')
   } else {

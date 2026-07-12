@@ -165,7 +165,7 @@ function readSessionCookie(cookieHeader: string): string | null {
   return null
 }
 
-function isAllowedOrigin(origin: string, c: Context, trustedOrigins: Set<string>): boolean {
+export function isAllowedOrigin(origin: string, c: Context, trustedOrigins: Set<string>): boolean {
   // Same-origin: Origin's host matches our Host header.
   const host = c.req.header('host')
   if (host) {

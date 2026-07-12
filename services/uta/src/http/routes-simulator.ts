@@ -20,6 +20,11 @@ import { z } from 'zod'
 import type { UTAEngineContext } from '../types.js'
 import { MockBroker } from '../domain/trading/brokers/mock/MockBroker.js'
 import { SEC_TYPES, type SecType } from '../domain/trading/contract-discipline.js'
+import { assertVenueWriteAllowed } from './venue-policy.js'
+
+// Simulator god-view ops all mutate the mock book, so every mutating method
+// runs through the same venue-write gate as real order entry.
+const MUTATING_METHODS = new Set(['POST', 'PUT', 'DELETE', 'PATCH'])
 
 // ==================== Schemas ====================
 
@@ -104,6 +109,16 @@ async function parseBody<T extends z.ZodTypeAny>(c: Context, schema: T): Promise
 
 export function createSimulatorRoutes(ctx: UTAEngineContext) {
   const app = new Hono()
+
+  // Gate every simulator mutation through the same venue-write policy as real
+  // order entry (lite/readonly/allowAiTrading). Reads (GET) pass through.
+  app.use('*', async (c, next) => {
+    if (MUTATING_METHODS.has(c.req.method.toUpperCase())) {
+      const denied = await assertVenueWriteAllowed(ctx, c)
+      if (denied) return denied
+    }
+    return next()
+  })
 
   /** List all simulator-capable UTAs. */
   app.get('/utas', (c) => {

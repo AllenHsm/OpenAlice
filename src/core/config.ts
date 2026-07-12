@@ -813,6 +813,18 @@ export async function readAgentConfig() {
   }
 }
 
+/** Read trading config from disk (called per-request for hot-reload). Used by
+ *  UTA's in-process policy gate so a trading-mode change takes effect without
+ *  a restart, mirroring how `readAgentConfig` hot-reads `allowAiTrading`. */
+export async function readTradingConfig() {
+  try {
+    const raw = JSON.parse(await readFile(resolve(CONFIG_DIR, 'trading.json'), 'utf-8'))
+    return tradingSchema.parse(raw)
+  } catch {
+    return tradingSchema.parse({})
+  }
+}
+
 /** Read AI provider config from disk (called per-request for hot-reload). */
 export async function readAIProviderConfig() {
   try {

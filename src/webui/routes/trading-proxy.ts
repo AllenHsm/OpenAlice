@@ -15,6 +15,8 @@
 import { Hono } from 'hono'
 import { randomUUID } from 'node:crypto'
 import { describeTradingMode, type TradingModePolicy } from '../../services/trading-mode.js'
+import { readUTAServiceToken } from '../../core/uta-service-token.js'
+import { isAllowedOrigin } from '../middleware/auth.js'
 import type { Logger } from '../../core/app-logger.js'
 
 // Total request timeout. UTA is on the loopback interface so connect is
@@ -40,11 +42,19 @@ export function createTradingProxyRoutes(opts: {
   /** Optional structured logger — records proxy failures with the correlation
    *  id so Alice's log lines up with UTA's access log. */
   logger?: Logger
+  /** CSRF-trusted Origins (mirrors the auth middleware's set). Used by the
+   *  venue-mutation Origin rider that closes the loopback-passthrough gap. */
+  csrfTrustedOrigins?: string[]
+  /** Service-token reader for the Alice↔UTA auth boundary. Injectable for
+   *  tests; defaults to the shared token module. */
+  readServiceToken?: (o?: { forceReload?: boolean }) => Promise<string | undefined>
 }): Hono {
   const app = new Hono()
   const base = opts.utaBaseUrl?.replace(/\/$/, '')
   const disabledReason = opts.disabledReason
   const log = opts.logger
+  const csrfTrustedOrigins = new Set(opts.csrfTrustedOrigins ?? [])
+  const readServiceToken = opts.readServiceToken ?? readUTAServiceToken
   const getPolicy = opts.getPolicy ?? (() => ({
     mode: disabledReason === 'lite_mode' ? 'lite' : 'pro',
     source: disabledReason === 'lite_mode' ? 'env' : 'auto',
@@ -139,6 +149,18 @@ export function createTradingProxyRoutes(opts: {
         hint: describeTradingMode('readonly'),
       }, 403)
     }
+    // CSRF rider — closes the loopback-passthrough gap. Alice's auth
+    // middleware skips its Origin check for loopback requests, so a browser
+    // page on a rogue local origin could otherwise drive a venue mutation
+    // through this proxy. Re-check the Origin here for venue writes only.
+    // Absent Origin (curl / CLI / server-to-server) stays allowed, matching
+    // the auth middleware's documented stance.
+    if (isVenueMutation(c.req.method, c.req.path)) {
+      const origin = c.req.header('origin')
+      if (origin && !isAllowedOrigin(origin, c, csrfTrustedOrigins)) {
+        return c.json({ error: 'Forbidden: origin not allowed', code: 'CSRF_ORIGIN' }, 403)
+      }
+    }
     if (!base) {
       return c.json({
         error: 'UTA unavailable',
@@ -162,24 +184,51 @@ export function createTradingProxyRoutes(opts: {
     // log and UTA's access log for the same request.
     const reqId = forwardHeaders.get('x-request-id') ?? randomUUID()
     forwardHeaders.set('x-request-id', reqId)
+    // Actor tag: ALWAYS 'user' for this human-approval path. `x-alice-actor`
+    // is NOT in the passthrough allowlist, so any inbound value was already
+    // dropped — setting it here is spoof-proof. UTA's policy gate treats
+    // 'user' as human-approved (allowed in pro mode regardless of allowAiTrading).
+    forwardHeaders.set('x-alice-actor', 'user')
+    // Service token for the Alice↔UTA auth boundary.
+    const token = await readServiceToken()
+    if (token) forwardHeaders.set('authorization', `Bearer ${token}`)
 
-    const controller = new AbortController()
-    const connectTimer = setTimeout(() => controller.abort(), PROXY_TIMEOUT_MS)
+    // Buffer the request body so a 401 self-heal retry can re-send it. The
+    // trading / simulator API carries only small JSON bodies, so buffering
+    // here does not affect response streaming (SSE / chunked responses still
+    // pass through untouched below). Drop any forwarded content-length so
+    // fetch computes the correct one from the buffered body.
+    const bodyBuf = hasBody(incoming.method) ? await incoming.arrayBuffer() : null
+    forwardHeaders.delete('content-length')
+
+    const doFetch = async (): Promise<Response> => {
+      const controller = new AbortController()
+      const connectTimer = setTimeout(() => controller.abort(), PROXY_TIMEOUT_MS)
+      try {
+        return await fetch(target, {
+          method: incoming.method,
+          headers: forwardHeaders,
+          body: bodyBuf,
+          signal: controller.signal,
+          redirect: 'manual',
+        })
+      } finally {
+        clearTimeout(connectTimer)
+      }
+    }
 
     let upstream: Response
     try {
-      upstream = await fetch(target, {
-        method: incoming.method,
-        headers: forwardHeaders,
-        body: hasBody(incoming.method) ? incoming.body : null,
-        // duplex required when streaming request body — Node fetch needs it
-        // when body is a ReadableStream.
-        ...(hasBody(incoming.method) ? { duplex: 'half' } : {}),
-        signal: controller.signal,
-        redirect: 'manual',
-      } as RequestInit)
+      upstream = await doFetch()
+      // Self-heal a rotated service token: on 401, re-read (forceReload) and
+      // retry exactly once.
+      if (upstream.status === 401) {
+        const fresh = await readServiceToken({ forceReload: true })
+        if (fresh) forwardHeaders.set('authorization', `Bearer ${fresh}`)
+        await upstream.text().catch(() => { /* drain discarded 401 body */ })
+        upstream = await doFetch()
+      }
     } catch (err) {
-      clearTimeout(connectTimer)
       const msg = err instanceof Error ? err.message : String(err)
       log?.warn('uta proxy request failed', { reqId, method: incoming.method, path: c.req.path, error: msg })
       return c.json({
@@ -187,8 +236,6 @@ export function createTradingProxyRoutes(opts: {
         detail: msg,
         hint: 'Trading service is not reachable. Alice is running in lite mode.',
       }, 502)
-    } finally {
-      clearTimeout(connectTimer)
     }
 
     // Re-wrap with a fresh Headers object so downstream middleware (CORS,

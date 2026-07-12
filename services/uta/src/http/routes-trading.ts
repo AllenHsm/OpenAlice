@@ -8,6 +8,7 @@ import { searchTradeableContracts } from '../domain/trading/contract-search.js'
 import type { AssetClassHint } from '@traderalice/uta-protocol'
 import { executeOneShotOrder, type OrderEntryPhase } from '../domain/trading/order-entry.js'
 import { projectOrderHistory, projectTradeHistory } from '../domain/trading/order-history.js'
+import { assertVenueWriteAllowed } from './venue-policy.js'
 
 // ==================== Order entry schemas ====================
 //
@@ -450,6 +451,8 @@ export function createTradingRoutes(ctx: UTAEngineContext) {
 
   // Push (manual approval — the AI tool is hollowed out, only humans can push)
   app.post('/uta/:id/wallet/push', async (c) => {
+    const denied = await assertVenueWriteAllowed(ctx, c)
+    if (denied) return denied
     const uta = ctx.utaManager.get(c.req.param('id'))
     if (!uta) return c.json({ error: 'Account not found' }, 404)
     if (!uta.status().pendingMessage) return c.json({ error: 'Nothing to push' }, 400)
@@ -527,6 +530,8 @@ export function createTradingRoutes(ctx: UTAEngineContext) {
   // is a route-layer convenience.
 
   app.post('/uta/:id/wallet/place-order', async (c) => {
+    const denied = await assertVenueWriteAllowed(ctx, c)
+    if (denied) return denied
     const uta = ctx.utaManager.get(c.req.param('id'))
     if (!uta) return c.json({ error: 'UTA not found' }, 404)
     let body: z.infer<typeof placeOrderSchema>
@@ -542,6 +547,8 @@ export function createTradingRoutes(ctx: UTAEngineContext) {
   })
 
   app.post('/uta/:id/wallet/close-position', async (c) => {
+    const denied = await assertVenueWriteAllowed(ctx, c)
+    if (denied) return denied
     const uta = ctx.utaManager.get(c.req.param('id'))
     if (!uta) return c.json({ error: 'UTA not found' }, 404)
     let body: z.infer<typeof closePositionSchema>
@@ -558,6 +565,8 @@ export function createTradingRoutes(ctx: UTAEngineContext) {
   })
 
   app.post('/uta/:id/wallet/cancel-order', async (c) => {
+    const denied = await assertVenueWriteAllowed(ctx, c)
+    if (denied) return denied
     const uta = ctx.utaManager.get(c.req.param('id'))
     if (!uta) return c.json({ error: 'UTA not found' }, 404)
     let body: z.infer<typeof cancelOrderSchema>

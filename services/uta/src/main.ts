@@ -15,7 +15,9 @@ import { serve } from '@hono/node-server'
 import { createAppLogger } from '@/core/app-logger.js'
 import { logsPath } from '@/core/paths.js'
 import { createRequestLog, type RequestLogVariables } from './http/request-log.js'
-import { loadConfig, readUTAsConfig, purgeEphemeralUTAs, type UTAConfig } from '@/core/config.js'
+import { createServiceAuthMiddleware } from './http/service-auth.js'
+import { loadConfig, readUTAsConfig, purgeEphemeralUTAs, readAgentConfig, readTradingConfig, type UTAConfig } from '@/core/config.js'
+import { loadOrCreateUTAServiceToken } from '@/core/uta-service-token.js'
 import { parseDuration } from '@/core/duration.js'
 import { createEventLog } from '@/core/event-log.js'
 import { ToolCenter } from '@/core/tool-center.js'
@@ -40,6 +42,14 @@ import type { UTAEngineContext } from './types.js'
 
 const UTA_PORT = Number(process.env['OPENALICE_UTA_PORT'] ?? 47333)
 const CATALOG_REFRESH_MS = 6 * 60 * 60 * 1000  // 6h
+
+/** Parse OPENALICE_TRADING_MODE into a trading mode, or undefined. Kept local
+ *  to avoid pulling Alice's trading-mode service (and its supervisor deps)
+ *  into the UTA process just for an env parse. */
+function parseTradingModeEnv(raw: string | undefined): 'lite' | 'readonly' | 'pro' | undefined {
+  const v = raw?.trim().toLowerCase()
+  return v === 'lite' || v === 'readonly' || v === 'pro' ? v : undefined
+}
 
 // Module-scope so both main() and the top-level fatal handler write to the
 // same rotating uta.log sink. mirrorConsole (default) keeps `pnpm dev` output.
@@ -152,6 +162,19 @@ async function main(): Promise<void> {
   }, CATALOG_REFRESH_MS)
   catalogRefreshTimer.unref?.()
 
+  // ==================== Service auth token ====================
+  // Shared secret for the Alice↔UTA HTTP boundary. Alice co-creates the same
+  // token at its own boot; wx-exclusive create means whoever wins is adopted
+  // by the other. `OPENALICE_UTA_AUTH=0` disables the gate for constrained
+  // local setups (RED warning below so it can't slip by unnoticed).
+  const serviceToken = await loadOrCreateUTAServiceToken()
+  const authDisabled = process.env['OPENALICE_UTA_AUTH'] === '0'
+  if (authDisabled) {
+    // Red so it stands out in `pnpm dev` output — running the live-order path
+    // with no token gate is a foot-gun, not a normal configuration.
+    log.warn('\x1b[31mUTA service auth DISABLED (OPENALICE_UTA_AUTH=0) — venue-mutating routes accept UNAUTHENTICATED local requests\x1b[0m')
+  }
+
   // ==================== HTTP app ====================
 
   const app = new Hono<{ Variables: RequestLogVariables }>()
@@ -162,11 +185,17 @@ async function main(): Promise<void> {
   app.use('*', createRequestLog(log))
 
   // Health probe — used by Guardian readiness gate and Alice BFF supervisor.
+  // Not under `/api/*`, so the service-auth gate below never touches it.
   app.get('/__uta/health', (c) => c.json({
     ok: true,
     startedAt,
     utas: utaManager.listUTAs().length,
   }))
+
+  // Service-auth gate — mounted AFTER the access log (so reqId is already set)
+  // and BEFORE the route table. v1 enforces only on mutating methods; GETs
+  // stay open this release. Fail-closed when no token + not disabled.
+  app.use('/api/*', createServiceAuthMiddleware({ token: serviceToken, disabled: authDisabled }))
 
   // Trading routes — UTA-side handlers, narrowly typed via UTAEngineContext.
   // Only utaManager / fxService / snapshotService are exposed because that's
@@ -176,6 +205,19 @@ async function main(): Promise<void> {
     utaManager,
     fxService,
     snapshotService,
+    // In-UTA policy the venue-write gate consults. Both hooks read live state
+    // per call (env / config on disk) so operator toggles apply without a UTA
+    // restart — same discipline as Alice's tool-layer `allowAiTrading`.
+    policy: {
+      mode: async () => {
+        const envMode = parseTradingModeEnv(process.env['OPENALICE_TRADING_MODE'])
+        if (envMode) return envMode
+        const cfg = await readTradingConfig()
+        if (cfg.mode) return cfg.mode
+        return utaManager.size > 0 ? 'pro' : 'lite'
+      },
+      allowAiTrading: async () => (await readAgentConfig()).allowAiTrading,
+    },
   }
   app.route('/api/trading', createTradingRoutes(tradingCtx))
   // Simulator endpoints — MockBroker-only god-view operations the

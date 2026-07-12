@@ -76,6 +76,9 @@ function makeRoutes(uta: unknown) {
       listUTAs: () => [],
       getAggregatedEquity: vi.fn(),
     },
+    // Permissive policy stub — venue-write gate allows all here; the gate's
+    // own matrix is proven in venue-policy.spec.ts.
+    policy: { mode: async () => 'pro' as const, allowAiTrading: async () => true },
     snapshotService: undefined,
   } as unknown as UTAEngineContext
   return createTradingRoutes(ctx)

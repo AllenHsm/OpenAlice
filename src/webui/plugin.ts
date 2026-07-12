@@ -223,12 +223,14 @@ export class WebPlugin implements Plugin {
     const utaProxy = createTradingProxyRoutes({
       utaBaseUrl: resolveUTAUrl(),
       getPolicy: ctx.tradingModePolicy,
+      csrfTrustedOrigins,
       ...(ctx.logger ? { logger: ctx.logger.child({ component: 'trading-proxy' }) } : {}),
     })
     app.route('/api/trading', utaProxy)
     app.route('/api/simulator', createTradingProxyRoutes({
       utaBaseUrl: resolveUTAUrl(),
       getPolicy: ctx.tradingModePolicy,
+      csrfTrustedOrigins,
       ...(ctx.logger ? { logger: ctx.logger.child({ component: 'simulator-proxy' }) } : {}),
     }))
     app.route('/api/tools', createToolsRoutes(ctx.toolCenter))
