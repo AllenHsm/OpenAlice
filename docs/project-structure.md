@@ -57,7 +57,7 @@ src/                           Alice process
 │   │                          schedules, CLI shims, file/git operations
 │   ├── adapters/              claude / codex / opencode / pi / shell
 │   ├── cli/                   alice, alice-uta, alice-workspace, traderhub
-│   └── templates/             built-in chat and auto-quant templates
+│   └── templates/             built-in chat, auto-quant, and equity-quant templates
 ├── services/
 │   ├── auth/                  admin token and web session services
 │   ├── uta-client/            Alice-side UTA SDK adapters

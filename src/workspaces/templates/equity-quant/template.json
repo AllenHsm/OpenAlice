@@ -1,0 +1,6 @@
+{
+  "displayName": "Equity-Quant",
+  "groupOrder": 21,
+  "description": "Equity-Quant autoresearch workspace — clones the Equity-Quant US-equity backtesting repo (private; a fresh clone needs your git SSH access, or set EQ_TEMPLATE_DIR to a local checkout), then makes per-workspace local clones with an autoresearch/<tag> branch and isolated per-workspace data. Research-only: does not enable OpenAlice's trading CLI/skill.",
+  "defaultAgents": ["claude", "codex"]
+}

@@ -8,16 +8,30 @@
 
 import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
+import { templatesPath } from '@/core/paths.js';
+
 import { injectWorkspaceContext } from './context-injector.js';
-import type { TemplateMeta } from './template-registry.js';
+import type { Logger } from './logger.js';
+import { TemplateRegistry, type TemplateMeta } from './template-registry.js';
 import { commitInitial } from './workspace-creator.js';
+
+const noopLogger = {
+  debug() {},
+  info() {},
+  warn() {},
+  error() {},
+  event() {},
+  child() {
+    return noopLogger;
+  },
+} as unknown as Logger;
 
 const HERE = fileURLToPath(new URL('.', import.meta.url)); // src/workspaces/
 const CHAT_DIR = join(HERE, 'templates', 'chat');
@@ -25,6 +39,8 @@ const CHAT_FILES = join(CHAT_DIR, 'files');
 const CHAT_BOOTSTRAP = join(CHAT_DIR, 'bootstrap.mjs');
 const AQ_DIR = join(HERE, 'templates', 'auto-quant');
 const AQ_BOOTSTRAP = join(AQ_DIR, 'bootstrap.mjs');
+const EQ_DIR = join(HERE, 'templates', 'equity-quant');
+const EQ_BOOTSTRAP = join(EQ_DIR, 'bootstrap.mjs');
 
 /**
  * Run a bootstrap.mjs exactly as the launcher's runScript does: on the bundled
@@ -49,6 +65,20 @@ function autoQuantMeta(): TemplateMeta {
     bootstrapScript: AQ_BOOTSTRAP,
     filesDir: join(AQ_DIR, 'files'),
     templateDir: AQ_DIR,
+    version: '1.0.0',
+    defaultAgents: ['claude', 'codex'],
+    injectTools: false,
+    injectPersona: false,
+    bundledSkills: [],
+  };
+}
+
+function equityQuantMeta(): TemplateMeta {
+  return {
+    name: 'equity-quant',
+    bootstrapScript: EQ_BOOTSTRAP,
+    filesDir: join(EQ_DIR, 'files'),
+    templateDir: EQ_DIR,
     version: '1.0.0',
     defaultAgents: ['claude', 'codex'],
     injectTools: false,
@@ -157,6 +187,60 @@ describe('auto-quant workspace create: clone → scrub → commit', () => {
     expect((await run('git', ['-C', aqDir, 'log', '--pretty=%s'])).trim()).toBe('auto-quant: aqtag');
     expect((await run('git', ['-C', aqDir, 'status', '--porcelain'])).trim()).toBe('');
     expect((await run('git', ['-C', aqDir, 'rev-parse', '--abbrev-ref', 'HEAD'])).trim()).toBe('autoresearch/aqtag');
+  });
+});
+
+describe('equity-quant workspace create: clone → scrub → commit', () => {
+  it('scrubs cloned history + remote into a fresh-git workspace with one launcher commit', async () => {
+    // fake upstream: history + an origin pointing at the (placeholder) public repo
+    const src = join(parent, 'fake-equity-quant');
+    await run('git', ['init', '-q', '-b', 'main', src]);
+    await writeFile(join(src, 'strategy.py'), 'print("hi")\n');
+    await run('git', ['-C', src, 'add', '.']);
+    await run('git', ['-C', src, '-c', 'user.email=u@x', '-c', 'user.name=u', 'commit', '-q', '-m', 'upstream history']);
+    await run('git', ['-C', src, 'remote', 'add', 'origin', 'https://github.com/allenhu/equity-quant.git']);
+
+    const eqDir = join(parent, 'eq-workspace');
+    await runBootstrap(EQ_BOOTSTRAP, ['eqtag', eqDir], { EQ_TEMPLATE_DIR: src });
+    // equity-quant injects nothing (all flags false); launcher still commits.
+    await injectWorkspaceContext({ template: equityQuantMeta(), wsId: 'ws-eq-1', dir: eqDir });
+    await commitInitial(eqDir, 'equity-quant: eqtag');
+
+    // working tree carries the upstream content + the results scaffold...
+    expect(existsSync(join(eqDir, 'strategy.py'))).toBe(true);
+    expect(existsSync(join(eqDir, 'results.tsv'))).toBe(true);
+    expect(await readFile(join(eqDir, 'results.tsv'), 'utf8')).toBe(
+      'commit\tevent\tstrategy_name\tis_sharpe\toos_sharpe\tnet_return\tmax_dd\tturnover\tverdict\tnote\n',
+    );
+    // ...but history + remote are scrubbed (the Harness rule)
+    expect((await run('git', ['-C', eqDir, 'remote', '-v'])).trim()).toBe('');
+    expect((await run('git', ['-C', eqDir, 'log', '--pretty=%s'])).trim()).toBe('equity-quant: eqtag');
+    expect((await run('git', ['-C', eqDir, 'status', '--porcelain'])).trim()).toBe('');
+    expect((await run('git', ['-C', eqDir, 'rev-parse', '--abbrev-ref', 'HEAD'])).trim()).toBe('autoresearch/eqtag');
+  });
+});
+
+describe('template registry — real filesystem discovery', () => {
+  it('discovers equity-quant alongside the other built-in templates', async () => {
+    const registry = await TemplateRegistry.load(templatesPath(), noopLogger);
+
+    const names = registry.list().map((t) => t.name);
+    expect(names).toContain('equity-quant');
+    expect(names).toContain('auto-quant');
+    expect(names).toContain('chat');
+
+    const eq = registry.get('equity-quant');
+    expect(eq).toBeDefined();
+    expect(eq?.displayName).toBe('Equity-Quant');
+    expect(eq?.groupOrder).toBe(21);
+    expect(eq?.defaultAgents).toEqual(['claude', 'codex']);
+    // Research-only posture: no CLI playbooks (incl. the alice-uta trading
+    // skill), no persona composition, no extra bundled skills.
+    expect(eq?.injectTools).toBe(false);
+    expect(eq?.injectPersona).toBe(false);
+    expect(eq?.bundledSkills).toEqual([]);
+    expect(eq?.version).toBe('1.0.0'); // from README frontmatter
+    expect(eq?.bootstrapScript).toBe(EQ_BOOTSTRAP);
   });
 });
 
